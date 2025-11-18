@@ -1,194 +1,320 @@
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
-const morgan = require('morgan');
 const { createClient } = require('@supabase/supabase-js');
+const { nanoid } = require('nanoid');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(morgan('dev'));
+const PORT = process.env.PORT || 3000;
 
+// 🔗 Prefixo fixo para a URL curta
+// Exemplo salvo no banco: lnk.hb/a1B2c3
+const SHORT_DOMAIN = 'lnk.hb';
+
+// 🟦 Configuração do Supabase
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error('Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no .env');
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌ SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY/ANON_KEY não definido(s) no .env');
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// 🧩 Middlewares básicos
+app.use(
+  cors({
+    origin: 'http://localhost:4200',
+    credentials: true
+  })
+);
+app.use(express.json());
+
+// Helper: obter userId de query ou body
+function getUserId(req) {
+  return req.query.userId || req.body.userId || req.body.user_id || null;
+}
+
+// ======================== HEALTH =========================
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ ok: true, message: 'LinkHub API rodando.' });
 });
 
-// Links
+// ========================= LINKS =========================
+
+// GET /api/links?userId=...
 app.get('/api/links', async (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(400).json({ error: 'userId é obrigatório' });
+    }
 
-  const { data, error } = await supabase
-    .from('links')
-    .select('*')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false });
+    const { data, error } = await supabase
+      .from('links')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+    if (error) return res.status(400).json({ error });
+
+    res.json(data || []);
+  } catch (err) {
+    console.error('Erro ao buscar links:', err);
+    res.status(500).json({ error: 'Erro ao buscar links' });
+  }
 });
 
+// POST /api/links
 app.post('/api/links', async (req, res) => {
-  const { userId, title, url, shortUrl, tags, collectionId } = req.body;
-  if (!userId || !title || !url) {
-    return res.status(400).json({ error: 'userId, title e url são obrigatórios' });
+  try {
+    const userId = getUserId(req);
+    const { title, url, tags, collection_id } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId é obrigatório' });
+    }
+    if (!title || !url) {
+      return res.status(400).json({ error: 'title e url são obrigatórios' });
+    }
+
+    // 🔐 Gera código curto e monta short_url: lnk.hb/asd123
+    const code = nanoid(6);
+    const short_url = `${SHORT_DOMAIN}/${code}`;
+
+    const { data, error } = await supabase
+      .from('links')
+      .insert([
+        {
+          user_id: userId,
+          title,
+          url,
+          short_url,
+          tags: tags || [],
+          collection_id: collection_id || null
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error });
+
+    res.status(201).json(data);
+  } catch (err) {
+    console.error('Erro ao criar link:', err);
+    res.status(500).json({ error: 'Erro ao criar link' });
   }
-
-  const { data, error } = await supabase
-    .from('links')
-    .insert({
-      user_id: userId,
-      title,
-      url,
-      short_url: shortUrl,
-      tags,
-      collection_id: collectionId || null
-    })
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
 });
 
+// PUT /api/links/:id
 app.put('/api/links/:id', async (req, res) => {
-  const { id } = req.params;
-  const payload = req.body;
+  try {
+    const { id } = req.params;
+    const { title, url, tags, collection_id, is_favorite } = req.body;
 
-  const { data, error } = await supabase
-    .from('links')
-    .update({
-      title: payload.title,
-      url: payload.url,
-      short_url: payload.short_url,
-      tags: payload.tags,
-      collection_id: payload.collection_id
-    })
-    .eq('id', id)
-    .select()
-    .single();
+    const updateData = {};
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+    if (title !== undefined) updateData.title = title;
+    if (url !== undefined) updateData.url = url;
+    if (tags !== undefined) updateData.tags = tags;
+    if (collection_id !== undefined) updateData.collection_id = collection_id;
+    if (is_favorite !== undefined) updateData.is_favorite = is_favorite;
 
-app.delete('/api/links/:id', async (req, res) => {
-  const { id } = req.params;
+    // 👉 se você quiser regenerar a short_url quando a URL mudar, descomente isto:
+    // if (url !== undefined) {
+    //   const code = nanoid(6);
+    //   updateData.short_url = `${SHORT_DOMAIN}/${code}`;
+    // }
 
-  const { error } = await supabase
-    .from('links')
-    .delete()
-    .eq('id', id);
+    const { data, error } = await supabase
+      .from('links')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(204).send();
-});
+    if (error) return res.status(400).json({ error });
 
-// Collections
-app.get('/api/collections', async (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
-
-  const { data, error } = await supabase
-    .from('collections')
-    .select('*')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false });
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
-});
-
-app.post('/api/collections', async (req, res) => {
-  const { userId, name, description, visibility } = req.body;
-  if (!userId || !name) {
-    return res.status(400).json({ error: 'userId e name são obrigatórios' });
+    res.json(data);
+  } catch (err) {
+    console.error('Erro ao atualizar link:', err);
+    res.status(500).json({ error: 'Erro ao atualizar link' });
   }
-
-  const { data, error } = await supabase
-    .from('collections')
-    .insert({
-      user_id: userId,
-      name,
-      description,
-      visibility: visibility || 'publico'
-    })
-    .select()
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data);
 });
 
+// DELETE /api/links/:id
+app.delete('/api/links/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase.from('links').delete().eq('id', id);
+
+    if (error) return res.status(400).json({ error });
+
+    res.status(204).send();
+  } catch (err) {
+    console.error('Erro ao excluir link:', err);
+    res.status(500).json({ error: 'Erro ao excluir link' });
+  }
+});
+
+// ======================= COLEÇÕES ========================
+
+// GET /api/collections?userId=...
+app.get('/api/collections', async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(400).json({ error: 'userId é obrigatório' });
+    }
+
+    const { data, error } = await supabase
+      .from('collections')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) return res.status(400).json({ error });
+
+    res.json(data || []);
+  } catch (err) {
+    console.error('Erro ao buscar coleções:', err);
+    res.status(500).json({ error: 'Erro ao buscar coleções' });
+  }
+});
+
+// POST /api/collections
+app.post('/api/collections', async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { name, description, visibility } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'userId é obrigatório' });
+    }
+    if (!name) {
+      return res.status(400).json({ error: 'name é obrigatório' });
+    }
+
+    const { data, error } = await supabase
+      .from('collections')
+      .insert([
+        {
+          user_id: userId,
+          name,
+          description: description || null,
+          visibility: visibility || 'publico'
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error });
+
+    res.status(201).json(data);
+  } catch (err) {
+    console.error('Erro ao criar coleção:', err);
+    res.status(500).json({ error: 'Erro ao criar coleção' });
+  }
+});
+
+// PUT /api/collections/:id
 app.put('/api/collections/:id', async (req, res) => {
-  const { id } = req.params;
-  const payload = req.body;
+  try {
+    const { id } = req.params;
+    const { name, description, visibility } = req.body;
 
-  const { data, error } = await supabase
-    .from('collections')
-    .update({
-      name: payload.name,
-      description: payload.description,
-      visibility: payload.visibility
-    })
-    .eq('id', id)
-    .select()
-    .single();
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (visibility !== undefined) updateData.visibility = visibility;
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    const { data, error } = await supabase
+      .from('collections')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error });
+
+    res.json(data);
+  } catch (err) {
+    console.error('Erro ao atualizar coleção:', err);
+    res.status(500).json({ error: 'Erro ao atualizar coleção' });
+  }
 });
 
+// DELETE /api/collections/:id
 app.delete('/api/collections/:id', async (req, res) => {
-  const { id } = req.params;
+  try {
+    const { id } = req.params;
 
-  const { error } = await supabase
-    .from('collections')
-    .delete()
-    .eq('id', id);
+    const { error } = await supabase.from('collections').delete().eq('id', id);
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(204).send();
+    if (error) return res.status(400).json({ error });
+
+    res.status(204).send();
+  } catch (err) {
+    console.error('Erro ao excluir coleção:', err);
+    res.status(500).json({ error: 'Erro ao excluir coleção' });
+  }
 });
 
-// Métricas overview
+// ======================== MÉTRICAS ========================
+
+// GET /api/metrics/overview?userId=...
 app.get('/api/metrics/overview', async (req, res) => {
-  const { userId } = req.query;
-  if (!userId) return res.status(400).json({ error: 'userId é obrigatório' });
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(400).json({ error: 'userId é obrigatório' });
+    }
 
-  const { data: links, error: errLinks } = await supabase
-    .from('links')
-    .select('clicks, views, shares')
-    .eq('user_id', userId);
+    const { data: links, error: linksError } = await supabase
+      .from('links')
+      .select('views, shares')
+      .eq('user_id', userId);
 
-  if (errLinks) return res.status(500).json({ error: errLinks.message });
+    if (linksError) return res.status(400).json({ error: linksError });
 
-  const { data: cols, error: errCols } = await supabase
-    .from('collections')
-    .select('id')
-    .eq('user_id', userId);
+    const linksTotal = (links || []).length;
+    const totalViews = (links || []).reduce(
+      (sum, l) => sum + (l.views || 0),
+      0
+    );
+    const totalShares = (links || []).reduce(
+      (sum, l) => sum + (l.shares || 0),
+      0
+    );
 
-  if (errCols) return res.status(500).json({ error: errCols.message });
+    const { data: collections, error: collectionsError } = await supabase
+      .from('collections')
+      .select('id')
+      .eq('user_id', userId);
 
-  const linksTotal = links?.length || 0;
-  const collectionsTotal = cols?.length || 0;
-  const totalViews = (links || []).reduce((acc, l) => acc + (l.views || 0), 0);
-  const totalShares = (links || []).reduce((acc, l) => acc + (l.shares || 0), 0);
+    if (collectionsError)
+      return res.status(400).json({ error: collectionsError });
 
-  res.json({ linksTotal, collectionsTotal, totalViews, totalShares });
+    const collectionsTotal = (collections || []).length;
+
+    res.json({
+      linksTotal,
+      collectionsTotal,
+      totalViews,
+      totalShares
+    });
+  } catch (err) {
+    console.error('Erro ao buscar métricas:', err);
+    res.status(500).json({ error: 'Erro ao buscar métricas' });
+  }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log('Linkhub backend escutando na porta', port);
+// ========================= START =========================
+
+app.listen(PORT, () => {
+  console.log(`✅ LinkHub API rodando em http://localhost:${PORT}`);
 });
